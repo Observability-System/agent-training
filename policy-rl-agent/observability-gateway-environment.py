@@ -1,19 +1,28 @@
+from collections import defaultdict
 from termcolor import colored
 import sys
+import requests
 from kubernetes import client, config
 from observability_handlers import *
 
 class ObservabilityGatewayEnvironment:
-    def __init__(self):
+    def __init__(self, cr_name: str = None, namespace: str = None, port: int = 4500, timeout: float = 2.0):
         self.environment_name = "Observability Gateway"
         self.current_class_weights = {"gold": 0.5, "silver": 0.3, "bronze": 0.2}
         self.importance_parameters = {"staleness": 0.5, "batch_loss": 0.3, "backlog": 0.2}
         self.control_context = {
             "total_ingestion_rate": 1000,
-            "queue_capacity": 100
+            "class_queue_capacity": 100
         }
         self.metrics_proxy_url = "127.0.0.1:8000"
         self.metrics = None
+
+        self.source_count_per_class = defaultdict(dict)
+        self.pod_map = None
+
+        if cr_name and namespace:
+            self.pod_map = get_pod_ips_by_class(cr_name, namespace) or {}
+            self.retrieve_class_info(cr_name, namespace, port=port, timeout=timeout)
 
     def apply_rate_limits(self, request_rates: dict) -> dict:
         """
@@ -103,14 +112,85 @@ class ObservabilityGatewayEnvironment:
                 print(colored(f"Patched TrafficPolicy '{class_name}' with {tokens} tokens", "green"))
             except Exception as e:
                 print(colored(f"failed to patch TrafficPolicy '{class_name}': {e}", "red"), file=sys.stderr)
-    
-    def post_weights(self, weights: dict) -> dict:
-        return post_weights(weights)
+
+    def retrieve_class_info(self, cr_name: str, namespace: str, port: int = 4500, timeout: float = 2.0) -> dict:
+        """
+        Fetch /weights from one pod per class and update self.source_count_per_class.
+        Uses internal pod IPs (`self.pod_map`).
+
+        Returns:
+            dict: {class_name: {"weights": dict or None, "num_sources": int}}
+        """
+        results = {}
+        for cls, pods in self.pod_map.items():
+            pod_ip = next((ip for ip in (pods or {}).values() if ip), None)
+            if not pod_ip:
+                results[cls] = {"weights": None, "num_sources": self.source_count_per_class.get(cls, 0)}
+                continue
+
+            url = f"http://{pod_ip}:{port}/weights"
+            try:
+                resp = requests.get(url, timeout=timeout)
+                resp.raise_for_status()
+                data = resp.json() or {}
+
+                weights = data.get("weights")
+                num_sources = data.get("num_sources")
+
+                self.source_count_per_class[cls] = num_sources
+
+                results[cls] = {"weights": weights, "num_sources": self.source_count_per_class.get(cls, 0)}
+            except Exception:
+                results[cls] = {"weights": None, "num_sources": self.source_count_per_class.get(cls, 0)}
+
+        return results
+
+
+    def update_weights_for_all_pods(self, cr_name: str, namespace: str, weights_by_class: dict, port: int = 4500, timeout: float = 2.0) -> None:
+        """
+        Update weights for each pod inside each class.
+
+        Args:
+            weights_by_class (dict):
+                {
+                "classA": {
+                    "pod-a-123": {"src1": 0.7, "src2": 0.2},
+                    "pod-a-456": {"src1": 0.6, "src2": 0.3}
+                },
+                "classB": {
+                    "pod-b-789": {"src1": 0.5, "src2": 0.5}
+                }
+                }
+        """
+        for cls, pod_weights in (weights_by_class or {}).items():
+            class_pods = self.pod_map.get(cls, {})
+
+            for pod_name, weights in (pod_weights or {}).items():
+                pod_ip = class_pods.get(pod_name)
+
+                if not pod_ip:
+                    print(f"no IP found for pod {pod_name} in class {cls}", file=sys.stderr)
+                    continue
+
+                url = f"http://{pod_ip}:{port}/update_weights"
+                payload = {"weights": weights}
+
+                try:
+                    resp = requests.post(url, json=payload, timeout=timeout)
+                    resp.raise_for_status()
+
+                    # update internal state
+                    self.source_count_per_class[cls] = len(weights)
+
+                except Exception as e:
+                    print(f"failed to update weights for {cls}/{pod_name} ({pod_ip}): {e}", file=sys.stderr)
+
         
     def get_observations(self, window_minutes: int = 5) -> dict:
         metrics = get_observations(window_minutes, metrics_proxy_url=self.metrics_proxy_url)
-        restructured_metrics = restructure_observations(metrics)
+        restructured_metrics = restructure_observations(metrics, class_total_capacity=self.control_context["class_queue_capacity"], source_count_per_class=self.source_count_per_class)
         self.metrics = restructured_metrics
+
         # compute aggregated class-level metrics (averages + tail/max pain)
         aggregated = self.aggregate_class_metrics(restructured_metrics)
         return aggregated
@@ -273,8 +353,17 @@ class ObservabilityGatewayEnvironment:
     
 
 if __name__ == "__main__":
-    # env = ObservabilityGatewayEnvironment()
-    # observations = env.get_observations(window_minutes=5)
-    # print("Aggregated Observations:")
-    # print(observations)
-    print(get_pods_for_gateway("observabilitygateway", "observability"))
+    env = ObservabilityGatewayEnvironment(cr_name="prio-ingestion-gateway", namespace="observability")
+    observations = env.get_observations(window_minutes=5)
+
+    for pod, sources in env.metrics.get('gold', {}).items():
+        for src, metrics in sources.items():
+            print(f"Pod: {pod}, Source: {src}, Metrics: {metrics['forwarded_batches']}")
+    print(observations['gold'])
+    
+
+    # weights = env.tenant_score_function()
+    # weights = {"gold": {"prio-ingestion-gateway-gold-5dfd7b575d-qphlf": {"src1": 0.7, "src2": 0.15, "src3": 0.05, "src4": 0.1}, 
+    #                     "prio-ingestion-gateway-gold-5dfd7b575d-sd67p": {"src1": 0.6, "src2": 0.2, "src3": 0.1, "src4": 0.1},
+    #                     "prio-ingestion-gateway-gold-5dfd7b575d-v85pp": {"src1": 0.5, "src2": 0.25, "src3": 0.15, "src4": 0.1}}}
+    # env.update_weights_for_all_pods("prio-ingestion-gateway", "observability", weights)

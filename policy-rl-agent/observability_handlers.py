@@ -124,10 +124,14 @@ def get_observations(window_minutes: int = 5, metrics_proxy_url = "127.0.0.1", q
         return {"error": str(e)}
 
 
-def restructure_observations(result: dict) -> dict:
+def restructure_observations(result: dict, class_total_capacity=None, source_count_per_class=None) -> dict:
     """
     Transform a flat result dict (with keys like 'class=silver,source=src1')
     into a nested dict: {class: {pod: {source: {metric: value}}}}
+
+    if `class_total_capacity` is provided as a dict or scalar it will be used to compute
+     per-source capacity as `class_total_capacity[class] / num_sources`. 
+    `source_count_per_class` may be provided as a dict of counts per class.
     """
     from collections import defaultdict
     def parse_key(key):
@@ -172,8 +176,10 @@ def restructure_observations(result: dict) -> dict:
                 staleness_ratio = 1.0 - (fresh_good_batches / forwarded_batches) if forwarded_batches else 1.0
                 metrics['staleness_ratio'] = staleness_ratio
 
-                # 3) queue_length / 25
-                queue_ratio = queue_length / 25.0
+                # 3) simple division: per-source capacity = class_total_capacity / num_sources
+                num_sources = source_count_per_class[cls]
+                per_source_capacity = class_total_capacity / num_sources
+                queue_ratio = queue_length / per_source_capacity
                 metrics['queue_ratio'] = queue_ratio
 
     # convert defaultdicts to normal dicts
