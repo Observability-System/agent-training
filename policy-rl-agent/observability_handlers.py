@@ -3,50 +3,86 @@ import sys
 from termcolor import colored
 from kubernetes import client, config
 
-def get_pods_for_gateway(cr_name, namespace):
+def get_pod_ips_by_class(cr_name: str, namespace: str) -> dict:
+    """
+    Return pod IP addresses grouped by class for deployments owned by a custom resource.
+
+    This function inspects the Kubernetes API to find Deployments that are owned
+    by the specified custom resource (an ObservabilityGateway). It then finds
+    pods for each deployment (via the `app` label selector) and returns a
+    mapping of class -> { pod_name: pod_ip }.
+
+    Parameters
+    - cr_name (str): Name of the ObservabilityGateway custom resource.
+    - namespace (str): Kubernetes namespace where the CR and deployments live.
+
+    Returns
+    - dict: Mapping from class name (str) to a dict mapping pod name (str) to
+        pod IP address (str or None). Example:
+            {
+                "silver": {"src-abc-123": "10.0.0.5", "src-def-456": "10.0.0.6"},
+                "gold": {"src-xyz-789": "10.0.0.7"}
+            }
+
+    Notes
+    - Ownership of deployments is determined by comparing the deployment's
+        ownerReferences UID to the custom resource UID.
+    - The class for a deployment is determined (in order) from two sources:
+        1. the `observability-class` label, if present;
+        2. otherwise derived from the deployment name (strip the CR name
+           prefix and take the first dash-separated token).
+    """
+
+    # Load the local kubeconfig so the client can talk to the cluster
     config.load_kube_config("~/.kube/config")
 
     custom = client.CustomObjectsApi()
     apps = client.AppsV1Api()
     core = client.CoreV1Api()
 
-    # 1. Get the CR
+    # Retrieve the custom resource to identify which deployments belong to it
     cr = custom.get_namespaced_custom_object(
         group="observability.x-k8s.io",
         version="v1alpha1",
         namespace=namespace,
         plural="observabilitygateways",
-        name=cr_name
+        name=cr_name,
     )
     cr_uid = cr["metadata"]["uid"]
 
-    # 2. Find Deployments owned by the CR
-    deployments = apps.list_namespaced_deployment(namespace).items
-    owned_deployments = [
-        d for d in deployments
+    # Collect all deployments owned by this CR (ownerReferences ensures the link)
+    deps = [
+        d for d in apps.list_namespaced_deployment(namespace).items
         if any(o.uid == cr_uid for o in (d.metadata.owner_references or []))
     ]
 
-    pods = []
+    # Build a simple mapping: deployment's app label → class name 
+    # The app label uniquely identifies each deployment's pods
+    dep_class_by_app = {}
+    for d in deps:
+        app_value = d.spec.selector.match_labels["app"]
+        dep_class = (
+            d.metadata.labels.get("observability-class")
+            or d.metadata.name.replace(f"{cr_name}-", "").split("-")[0]
+        )
 
-    for deploy in owned_deployments:
-        # 3. Find ReplicaSets owned by the Deployment
-        rs_list = apps.list_namespaced_replica_set(namespace).items
-        owned_rs = [
-            rs for rs in rs_list
-            if any(o.uid == deploy.metadata.uid for o in (rs.metadata.owner_references or []))
-        ]
+        dep_class_by_app[app_value] = dep_class
 
-        # 4. Find Pods owned by each ReplicaSet
-        for rs in owned_rs:
-            pod_list = core.list_namespaced_pod(namespace).items
-            owned_pods = [
-                p for p in pod_list
-                if any(o.uid == rs.metadata.uid for o in (p.metadata.owner_references or []))
-            ]
-            pods.extend(owned_pods)
+    # Gather pods for each deployment and group them by class
+    result = {}
+    for d in deps:
+        app_value = d.spec.selector.match_labels["app"]
+        label_selector = f"app={app_value}"
 
-    return pods
+        # Kubernetes handles the pod filtering for us via the label selector
+        pods = core.list_namespaced_pod(namespace, label_selector=label_selector).items
+
+        # Store pod name → pod IP under the appropriate class
+        cls = dep_class_by_app[app_value]
+        for p in pods:
+            result.setdefault(cls, {})[p.metadata.name] = p.status.pod_ip
+
+    return result
 
 def post_weights(weights: dict) -> dict:
     """
