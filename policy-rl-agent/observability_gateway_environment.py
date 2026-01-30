@@ -64,12 +64,9 @@ class ObservabilityGatewayEnvironment:
 
         # load cluster config
         try:
-            config.load_incluster_config()
-        except Exception:
-            try:
-                config.load_kube_config()
-            except Exception as e:
-                raise RuntimeError(f"could not load kube config: {e}")
+            config.load_kube_config()
+        except Exception as e:
+            raise RuntimeError(f"could not load kube config: {e}")
 
         api = client.CustomObjectsApi()
 
