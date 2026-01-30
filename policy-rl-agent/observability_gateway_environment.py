@@ -22,6 +22,29 @@ class ObservabilityGatewayEnvironment:
         self.source_count_per_class = defaultdict(dict)
         self.pod_map = None
 
+        self.timeliness_slo = {
+            "gold": {
+                "prio-ingestion-gateway-gold-5dfd7b575d-qphlf": [
+                    {"source": "src1", "threshold": 15, "unit": "s"},
+                    {"source": "src2", "threshold": 20, "unit": "s"},
+                    {"source": "src3", "threshold": 20, "unit": "s"},
+                    {"source": "src4", "threshold": 20, "unit": "s"}
+                ],
+                "prio-ingestion-gateway-gold-5dfd7b575d-sd67p": [
+                    {"source": "src1", "threshold": 15, "unit": "s"},
+                    {"source": "src2", "threshold": 20, "unit": "s"},
+                    {"source": "src3", "threshold": 20, "unit": "s"},
+                    {"source": "src4", "threshold": 20, "unit": "s"}
+                ],
+                "prio-ingestion-gateway-gold-5dfd7b575d-v85pp": [
+                    {"source": "src1", "threshold": 15, "unit": "s"},
+                    {"source": "src2", "threshold": 20, "unit": "s"},
+                    {"source": "src3", "threshold": 20, "unit": "s"},
+                    {"source": "src4", "threshold": 20, "unit": "s"}
+                ]
+            }
+        }
+
         if cr_name and namespace:
             self.pod_map = get_pod_ips_by_class(cr_name, namespace) or {}
             self.fetch_class_info()
@@ -31,15 +54,24 @@ class ObservabilityGatewayEnvironment:
         Update TrafficPolicy CRs in namespace `observability-ingress` for each class
         based on provided weights.
 
-        request_rates: dict mapping class-name (e.g. 'gold') -> weight (float). Weights
-        must sum to 1.0 (floating tolerance accepted).
+        Args:
+            request_rates (dict): mapping class-name (e.g. 'gold') -> weight (float). Weights
+                must sum to 1.0 (floating tolerance accepted).
+
+                Example:
+                    {
+                        "gold": 0.5,
+                        "silver": 0.3,
+                        "bronze": 0.2
+                    }
 
         Assumption: `self.control_context['total_ingestion_rate']` is the total allowed
         ingestion rate for the CR's fill interval (the CR uses `fillInterval: "1m"`).
         The function calculates per-class tokens as `weight * total_ingestion_rate`
         and sets both `maxTokens` and `tokensPerFill` to that value.
 
-        Returns a dict of results keyed by class with patch status or error.
+        Returns:
+            dict: results keyed by class with patch status or error.
         """
         # validate input
         if not isinstance(request_rates, dict) or len(request_rates) == 0:
@@ -111,6 +143,31 @@ class ObservabilityGatewayEnvironment:
                 print(colored(f"Patched TrafficPolicy '{class_name}' with {tokens} tokens", "green"))
             except Exception as e:
                 print(colored(f"failed to patch TrafficPolicy '{class_name}': {e}", "red"), file=sys.stderr)
+
+    def set_timeliness_slo(self, slo_updates: dict, port: int = None) -> None:
+        """
+        Dynamically update the timeliness SLOs for classes and pods, and push updates to pods.
+
+        Args:
+            slo_updates (dict): New SLOs to apply, structured as:
+                {
+                    "classA": {
+                        "pod-name-1": [
+                            {"source": "src1", "threshold": 2, "unit": "s"},
+                            {"source": "src2", "threshold": 800, "unit": "ms"}
+                        ],
+                        "pod-name-2": [...]
+                    },
+                    "classB": {...}
+                }
+            port (int, optional): Pod port to use for updates.
+        """
+        if not isinstance(slo_updates, dict):
+            raise ValueError("slo_updates must be a dict")
+        self.timeliness_slo = slo_updates
+        print(colored(f"Timeliness SLOs updated: {self.timeliness_slo}", "green"))
+        # Push SLOs to pods immediately
+        self.push_slos_to_pods(slo_updates, port=port)
 
     def fetch_class_info(self, port: int = None) -> dict:
         """
@@ -395,6 +452,8 @@ class ObservabilityGatewayEnvironment:
 if __name__ == "__main__":
     env = ObservabilityGatewayEnvironment(cr_name="prio-ingestion-gateway", namespace="observability")
 
+    observations = env.get_observations(window_minutes=5)
+
     SLOs = {
         "gold": {
             "prio-ingestion-gateway-gold-5dfd7b575d-qphlf": [
@@ -417,13 +476,11 @@ if __name__ == "__main__":
             ]
         }
     }
+    env.set_timeliness_slo(SLOs)
 
-    observations = env.get_observations(window_minutes=5)
-
-    # env.push_slos_to_pods(SLOs)
     for pod, sources in env.metrics.get('gold', {}).items():
         for src, metrics in sources.items():
-            print(f"Pod: {pod}, Source: {src}, Metrics: {metrics['staleness_ratio']}")
+            print(f"Pod: {pod}, Source: {src}, Metrics: {metrics['staleness_ratio'], metrics['drop_ratio'], metrics['queue_ratio']}")
     
 
     # weights = env.compute_source_weights_per_class()
