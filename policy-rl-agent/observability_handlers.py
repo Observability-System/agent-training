@@ -3,6 +3,45 @@ import sys
 from termcolor import colored
 from kubernetes import client, config
 
+
+class Clients:
+    """Centralized endpoints/config for metric and agent HTTP endpoints.
+
+        Defaults are provided via constructor arguments. Typical defaults:
+            - metrics_proxy: "127.0.0.1:8000"
+            - pod_host: "localhost"
+            - pod_port: 4500
+    """
+    def __init__(self, metrics_proxy: str = "127.0.0.1:8000", pod_host: str = "localhost", pod_port: int = 4500):
+        self.metrics_proxy = metrics_proxy
+        self.pod_host = pod_host
+        try:
+            self.pod_port = int(pod_port)
+        except Exception:
+            self.pod_port = 4500
+
+    def observations_url(self) -> str:
+        return f"http://{self.metrics_proxy}/observations"
+    
+    def pod_url(self, pod_ip: str, path: str, port: int = None) -> str:
+        """Build an absolute URL to reach a pod by IP.
+
+        Args:
+            pod_ip: pod IP or hostname
+            path: request path, e.g. '/update_weights' or 'slo/update'
+            port: optional port override (defaults to pod_port)
+        """
+        if not pod_ip:
+            raise ValueError("pod_ip is required")
+        p = int(port) if port is not None else self.pod_port
+        if not path.startswith('/'):
+            path = '/' + path
+        return f"http://{pod_ip}:{p}{path}"
+
+
+# module-level default client
+DEFAULT_CLIENT = Clients()
+
 def get_pod_ips_by_class(cr_name: str, namespace: str) -> dict:
     """
     Return pod IP addresses grouped by class for deployments owned by a custom resource.
@@ -84,35 +123,21 @@ def get_pod_ips_by_class(cr_name: str, namespace: str) -> dict:
 
     return result
 
-def post_weights(weights: dict) -> dict:
+def fetch_observations(window_minutes: int = 5, client: Clients = None, queries=None) -> dict:
     """
-    POST the given weights to http://localhost:4500/update_weights as JSON.
-    weights: dict mapping source names to float values.
+    POST the given queries and window_minutes to the observations endpoint.
+    Args:
+        window_minutes: lookback window in minutes.
+        client: optional Clients instance (uses DEFAULT_CLIENT when omitted).
+        queries: optional list of metric query names to request. If None, a default set is used.
+
     Returns the response as a dict, or error info if request fails.
     """
-    url = "http://localhost:4500/update_weights"
-    headers = {"Content-Type": "application/json"}
-    data = {"weights": weights}
-    try:
-        response = requests.post(url, json=data, headers=headers)
-        response.raise_for_status()
-        return response.json() if response.content else {"status": "success", "code": response.status_code}
-    except Exception as e:
-        print(colored(f"POST to {url} failed: {e}", "red"), file=sys.stderr)
-        return {"error": str(e)}
-
-
-def get_observations(window_minutes: int = 5, metrics_proxy_url = "127.0.0.1", queries=None) -> dict:
-    """
-    POST the given queries and window_minutes to the observations endpoint (or Prometheus if implemented).
-    `queries`: optional list of metric query names to request. If None, a default set is used.
-    `metrics_proxy_url`: Optional base URL for Prometheus or metrics API.
-    Returns the response as a dict, or error info if request fails.
-    """
+    client = client or DEFAULT_CLIENT
     if queries is None:
         queries = ['forwarded_batches', 'dropped_batches', 'fresh_good_batches', 'queue_length']
 
-    url = f"http://{metrics_proxy_url}/observations"
+    url = client.observations_url()
     headers = {"Content-Type": "application/json"}
     data = {"queries": queries, "window_minutes": window_minutes}
     try:
@@ -124,7 +149,7 @@ def get_observations(window_minutes: int = 5, metrics_proxy_url = "127.0.0.1", q
         return {"error": str(e)}
 
 
-def restructure_observations(result: dict, class_total_capacity=None, source_count_per_class=None) -> dict:
+def transform_observations(result: dict, class_total_capacity=None, source_count_per_class=None) -> dict:
     """
     Transform a flat result dict (with keys like 'class=silver,source=src1')
     into a nested dict: {class: {pod: {source: {metric: value}}}}
