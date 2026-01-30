@@ -149,7 +149,7 @@ def fetch_observations(window_minutes: int = 5, client: Clients = None, queries=
         return {"error": str(e)}
 
 
-def transform_observations(result: dict, class_total_capacity=None, source_count_per_class=None) -> dict:
+def transform_observations(result: dict, class_total_capacity=None, source_count_per_class=None, drop_slo=None) -> dict:
     """
     Transform a flat result dict (with keys like 'class=silver,source=src1')
     into a nested dict: {class: {pod: {source: {metric: value}}}}
@@ -196,6 +196,24 @@ def transform_observations(result: dict, class_total_capacity=None, source_count
                 total_batches = forwarded_batches + dropped_batches
                 drop_ratio = dropped_batches / total_batches if total_batches else 0.0
                 metrics['drop_ratio'] = drop_ratio
+
+                # Compute drop_slo for this (cls, pod, src) if provided
+                # drop_slo should be a dict: class -> list of {source, budget}
+                drop_slo_val = None
+                if drop_slo and cls in drop_slo:
+                    # Find the budget for this source in the list
+                    for entry in drop_slo[cls]:
+                        # entry: {"source": ..., "budget": ...}
+                        if str(entry.get('source')) == str(src):
+                            try:
+                                drop_slo_val = float(entry.get('budget'))
+                            except Exception:
+                                drop_slo_val = None
+                            break
+                if drop_slo_val is not None:
+                    metrics['drop_excess'] = max(0.0, drop_ratio - drop_slo_val)
+                else:
+                    metrics['drop_excess'] = drop_ratio
 
                 # 2) 1 - fresh_good_batches / forwarded_batches
                 staleness_ratio = 1.0 - (fresh_good_batches / forwarded_batches) if forwarded_batches else 1.0

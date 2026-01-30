@@ -45,6 +45,15 @@ class ObservabilityGatewayEnvironment:
             }
         }
 
+        self.drop_slo = {
+            "gold": [
+                {"source": "src1", "budget": 0.4},
+                {"source": "src2", "budget": 0.6},
+                {"source": "src3", "budget": 0.6},
+                {"source": "src4", "budget": 0.6}
+            ]
+        }
+
         if cr_name and namespace:
             self.pod_map = get_pod_ips_by_class(cr_name, namespace) or {}
             self.fetch_class_info()
@@ -285,7 +294,7 @@ class ObservabilityGatewayEnvironment:
         
     def get_observations(self, window_minutes: int = 5) -> dict:
         metrics = fetch_observations(window_minutes, client=self.clients)
-        transformed_metrics = transform_observations(metrics, class_total_capacity=self.control_context["class_queue_capacity"], source_count_per_class=self.source_count_per_class)
+        transformed_metrics = transform_observations(metrics, class_total_capacity=self.control_context["class_queue_capacity"], source_count_per_class=self.source_count_per_class, drop_slo=self.drop_slo)
         self.metrics = transformed_metrics
 
         # compute aggregated class-level metrics (averages + tail/max pain)
@@ -480,7 +489,7 @@ if __name__ == "__main__":
 
     for pod, sources in env.metrics.get('gold', {}).items():
         for src, metrics in sources.items():
-            print(f"Pod: {pod}, Source: {src}, Metrics: {metrics['staleness_ratio'], metrics['drop_ratio'], metrics['queue_ratio']}")
+            print(f"Pod: {pod}, Source: {src}, Metrics: {metrics['staleness_ratio'], metrics['drop_excess'], metrics['queue_ratio']}")
     
 
     # weights = env.compute_source_weights_per_class()
